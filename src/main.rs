@@ -5,6 +5,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod derive;
+mod job;
 
 use bip39::Mnemonic;
 use eframe::egui;
@@ -37,6 +38,8 @@ struct App {
     /// Possibly-truncated copy used only for on-screen display.
     preview: String,
     status: String,
+    /// In-flight background generation job, if any.
+    job: Option<job::RunningJob>,
 }
 
 impl Default for App {
@@ -49,6 +52,7 @@ impl Default for App {
             output: String::new(),
             preview: String::new(),
             status: "Ready.".to_owned(),
+            job: None,
         }
     }
 }
@@ -60,7 +64,7 @@ fn entropy_len(words: usize) -> usize {
 }
 
 /// Generate one random English BIP-39 mnemonic with the given word count.
-fn generate_one(words: usize) -> Result<String, String> {
+pub(crate) fn generate_one(words: usize) -> Result<String, String> {
     let mut entropy = vec![0u8; entropy_len(words)];
     getrandom::fill(&mut entropy).map_err(|e| e.to_string())?;
     let mnemonic = Mnemonic::from_entropy(&entropy).map_err(|e| e.to_string())?;
@@ -68,43 +72,18 @@ fn generate_one(words: usize) -> Result<String, String> {
 }
 
 impl App {
-    fn generate(&mut self) {
-        let n = self.count.max(1);
-        let words = self.words;
-        let mut full = String::new();
-        for idx in 0..n {
-            let phrase = match generate_one(words) {
-                Ok(p) => p,
-                Err(e) => {
-                    self.status = format!("Error: {e}");
-                    return;
-                }
-            };
-            if self.derive {
-                let addrs = Mnemonic::parse(&phrase)
-                    .map_err(|e| e.to_string())
-                    .and_then(|m| derive::addresses_for(&m));
-                match addrs {
-                    Ok(a) => {
-                        full.push_str(&format!("#{}  {phrase}\n", idx + 1));
-                        full.push_str(&format!("    BTC  {}\n", a.btc));
-                        full.push_str(&format!("    ETH  {}\n", a.eth));
-                        full.push_str(&format!("    TRX  {}\n", a.trx));
-                        full.push_str(&format!("    SOL  {}\n", a.sol));
-                        full.push_str(&format!("    SUI  {}\n\n", a.sui));
-                    }
-                    Err(e) => {
-                        self.status = format!("Derivation error: {e}");
-                        return;
-                    }
-                }
-            } else {
-                full.push_str(&phrase);
-                full.push('\n');
-            }
+    /// Kick off generation on background threads. Returns immediately.
+    fn start_job(&mut self) {
+        if self.job.is_some() {
+            return;
         }
+        let count = self.count.max(1) as usize;
+        self.status = format!("Generating {count}…");
+        self.job = Some(job::start(count, self.words, self.derive));
+    }
 
-        // Build a bounded preview so the text box stays responsive for big counts.
+    /// Store a finished result: keep the full text, build a bounded preview.
+    fn apply_output(&mut self, full: String) {
         let line_count = full.lines().count();
         self.preview = if line_count > MAX_PREVIEW_LINES {
             let head: Vec<&str> = full.lines().take(MAX_PREVIEW_LINES).collect();
@@ -116,9 +95,24 @@ impl App {
         } else {
             full.clone()
         };
-
         self.output = full;
-        self.status = format!("Generated {n} × {words}-word mnemonic(s).");
+    }
+
+    /// Poll the background job; apply its result once it finishes.
+    fn poll_job(&mut self) {
+        let finished = self.job.as_ref().and_then(|j| j.try_take());
+        if let Some(result) = finished {
+            self.apply_output(result.text);
+            self.status = if result.cancelled {
+                format!("Cancelled — kept {} mnemonic(s).", result.produced)
+            } else {
+                format!(
+                    "Generated {} × {}-word mnemonic(s).",
+                    result.produced, self.words
+                )
+            };
+            self.job = None;
+        }
     }
 
     fn save(&mut self) {
@@ -180,6 +174,9 @@ mod tests {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.poll_job();
+        let job_state = self.job.as_ref().map(|j| (j.done(), j.total));
+
         egui::CentralPanel::default().show(ctx, |ui| {
             ui.heading("BIP-39 Mnemonic Generator");
             ui.label("Fresh random English BIP-39 mnemonics — offline, OS CSPRNG.");
@@ -187,7 +184,15 @@ impl eframe::App for App {
 
             ui.horizontal(|ui| {
                 ui.label("Count:");
-                ui.add(egui::DragValue::new(&mut self.count).range(1..=100_000).speed(1.0));
+                ui.add(
+                    egui::DragValue::new(&mut self.count)
+                        .range(1..=1_000_000)
+                        .speed(1.0),
+                )
+                .on_hover_text(
+                    "Runs in the background across all CPU cores.\n\
+                     For very large batches, use \"Save to file\".",
+                );
                 ui.add_space(16.0);
                 ui.label("Words:");
                 egui::ComboBox::from_id_salt("words")
@@ -209,8 +214,12 @@ impl eframe::App for App {
 
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if ui.button("Generate").clicked() {
-                    self.generate();
+                let running = job_state.is_some();
+                if ui
+                    .add_enabled(!running, egui::Button::new("Generate"))
+                    .clicked()
+                {
+                    self.start_job();
                 }
                 if ui.button("Copy all").clicked() {
                     if self.output.is_empty() {
@@ -229,6 +238,29 @@ impl eframe::App for App {
                         .hint_text("file name"),
                 );
             });
+
+            if let Some((done, total)) = job_state {
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        if let Some(j) = self.job.as_ref() {
+                            j.request_cancel();
+                        }
+                    }
+                    let frac = if total > 0 {
+                        (done as f32 / total as f32).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    ui.add(
+                        egui::ProgressBar::new(frac)
+                            .text(format!("{done} / {total}"))
+                            .desired_width(280.0),
+                    );
+                });
+                // Keep repainting so progress animates and completion is noticed.
+                ui.ctx().request_repaint();
+            }
 
             ui.add_space(4.0);
             ui.label(&self.status);
